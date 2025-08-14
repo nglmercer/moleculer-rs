@@ -15,14 +15,14 @@ version = "0.4.1"
 [dependencies]
 # async
 async-trait = "0.1"
-tokio = {version = "1.2", features = ["macros", "rt-multi-thread", "sync"]}
+tokio = {version = "1.47", features = ["macros", "rt-multi-thread", "sync"]}
 
 
 # actor framework
 act-zero = {version = "0.4", features = ["default-tokio"]}
 
 # nats
-async-nats = "0.37"
+async-nats = "0.42"
 futures = "0.3"
 
 # error handling
@@ -41,18 +41,18 @@ rand = "0.8"
 # node information
 get_if_addrs = "0.5.3"
 hostname = "0.4"
-sysinfo = "0.31"
+sysinfo = "0.37"
 
 # utils
 ctrlc = {version = "3.0", features = ["termination"]}
 derive_builder = "0.20"
 maplit = "1.0"
-strum = {version = "0.26", features = ["derive"]}
-uuid = {version = "1.10", features = ["serde", "v4"]}
-bytes = "1.7"
+strum = {version = "0.27", features = ["derive"]}
+uuid = {version = "1.18", features = ["serde", "v4"]}
+bytes = "1.10"
 
 [build-dependencies]
-built = "0.7"
+built = "0.8"
 
 # for examples
 [dev-dependencies]

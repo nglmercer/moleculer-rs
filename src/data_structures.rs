@@ -36,7 +36,7 @@ where
         self.queue.len()
     }
 
-    pub(crate) fn iter(&self) -> std::collections::vec_deque::Iter<T> {
+    pub(crate) fn iter(&self) -> std::collections::vec_deque::Iter<'_, T> {
         self.queue.iter()
     }
 
