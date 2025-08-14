@@ -152,7 +152,7 @@ impl ActionBuilder {
 #[serde(rename_all = "camelCase")]
 pub struct Service {
     name: String,
-    version: Option<i32>,
+    version: Option<String>,
 
     #[serde(default)]
     #[serde(skip_deserializing)]
@@ -172,18 +172,26 @@ impl Service {
         }
     }
 
-    pub fn set_version(mut self, version: i32) -> Self {
+    pub fn set_version(mut self, version: String) -> Self {
         self.version = Some(version);
         self
     }
 
+    fn _make_key(&self, suffix: &str) -> String {
+        if let Some(ref version) = self.version {
+            format!("{}.{}.{}", version, self.name, suffix)
+        } else {
+            format!("{}.{}", self.name, suffix)
+        }
+    }
+
     pub fn add_action(mut self, action: Action) -> Self {
-        self.actions.insert(action.name.clone(), action);
+        self.actions.insert(self._make_key(&action.name), action);
         self
     }
 
     pub fn add_event(mut self, event: Event) -> Self {
-        self.events.insert(event.name.clone(), event);
+        self.events.insert(self._make_key(&event.name), event);
         self
     }
 }
