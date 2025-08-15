@@ -294,7 +294,7 @@ pub(crate) enum DeserializeError {
     Json(serde_json::error::Error),
 }
 
-fn mol(config: &Config) -> Cow<str> {
+fn mol(config: &Config) -> Cow<'_, str> {
     if config.namespace.is_empty() {
         Cow::Borrowed("MOL")
     } else {

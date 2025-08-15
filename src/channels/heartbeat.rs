@@ -85,7 +85,7 @@ impl Heartbeat {
             heartbeat_interval: config.heartbeat_interval,
             timer: Timer::default(),
             system: System::new_with_specifics(
-                RefreshKind::new().with_cpu(CpuRefreshKind::everything()),
+                RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
             ),
         }
     }
