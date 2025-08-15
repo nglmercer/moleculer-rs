@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.1] – 2025-08-15
+
+- Updated dependencies
+- Actionsuse the moleculer 'version.serviceName.actionName' format automatically, thanks to [@imrefazekas ](https://github.com/imrefazekas), in [#29](https://github.com/avencera/moleculer-rs/pull/29)
+
 ## [0.4.0] – 2024-10-02
 
 - Updated broken dependencies that were preventing compilation on newer versions of Rust, thanks to [@isaac-nls](https://github.com/isaac-nls), in [#27](https://github.com/avencera/moleculer-rs/pull/27)
