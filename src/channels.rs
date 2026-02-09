@@ -109,6 +109,11 @@ impl ChannelSupervisor {
             Transporter::Nats(nats_address) => nats::Conn::new(nats_address)
                 .await
                 .expect("NATS should connect"),
+            Transporter::Http(_) => {
+                // For HTTP transporter, we'll use a placeholder connection
+                // The HTTP implementation is separate and doesn't integrate with channels yet
+                panic!("HTTP transporter is not yet fully integrated with the channel system. Use NATS for now.")
+            }
         };
 
         Self {

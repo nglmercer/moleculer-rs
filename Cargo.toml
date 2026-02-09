@@ -15,8 +15,7 @@ version = "0.4.1"
 [dependencies]
 # async
 async-trait = "0.1"
-tokio = {version = "1.47", features = ["macros", "rt-multi-thread", "sync"]}
-
+tokio = {version = "1.47", features = ["macros", "rt-multi-thread", "sync", "net"]}
 
 # actor framework
 act-zero = {version = "0.4", features = ["default-tokio"]}
@@ -50,6 +49,10 @@ maplit = "1.0"
 strum = {version = "0.27", features = ["derive"]}
 uuid = {version = "1.18", features = ["serde", "v4"]}
 bytes = "1.10"
+
+# http transporter
+reqwest = {version = "0.11", features = ["json"]}
+warp = "0.3"
 
 [build-dependencies]
 built = "0.8"

@@ -103,9 +103,11 @@ mod util;
 
 pub mod config;
 pub mod service;
+pub mod transporter;
 
 mod broker;
 mod channels;
+pub mod http_transporter;
 mod nats;
 
 use act_zero::runtimes::tokio::spawn_actor;

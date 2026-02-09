@@ -4,7 +4,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use act_zero::*;
 use async_trait::async_trait;
-use log::{error, warn};
+use log::warn;
 use serde_json::Value;
 use tokio::sync::oneshot::Sender;
 

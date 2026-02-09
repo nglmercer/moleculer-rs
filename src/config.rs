@@ -90,6 +90,7 @@ pub enum Logger {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Transporter {
     Nats(String),
+    Http(String),
 }
 
 impl Transporter {
@@ -97,6 +98,12 @@ impl Transporter {
     /// `Transporter::nats("nats://localhost:4222")`
     pub fn nats<S: Into<String>>(nats_address: S) -> Self {
         Self::Nats(nats_address.into())
+    }
+
+    /// Create an HTTP transporter with address, ex:
+    /// `Transporter::http("localhost:8080")`
+    pub fn http<S: Into<String>>(http_address: S) -> Self {
+        Self::Http(http_address.into())
     }
 }
 
