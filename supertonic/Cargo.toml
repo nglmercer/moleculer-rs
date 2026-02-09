@@ -1,0 +1,88 @@
+[package]
+name = "supertonic-tts"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# ONNX Runtime
+ort = "2.0.0-rc.11"
+
+# Array processing (like NumPy)
+ndarray = { version = "0.17", features = ["rayon"] }
+rand = "0.8"
+rand_distr = "0.4"
+
+# Parallel processing
+rayon = "1.10"
+
+# Audio processing
+hound = "3.5"
+rustfft = "6.2"
+
+# JSON serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# CLI argument parsing
+clap = { version = "4.5", features = ["derive"] }
+
+# Error handling
+anyhow = "1.0"
+
+# Unicode normalization
+unicode-normalization = "0.1"
+
+# Regular expressions
+regex = "1.10"
+
+# System calls
+libc = "0.2"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Base64 encoding for audio output
+base64 = "0.22"
+
+# Lazy static initialization
+once_cell = "1.19"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time handling
+chrono = "0.4"
+
+# Byte order handling for WAV
+byteorder = "1.5"
+
+# Error handling for main
+eyre = "0.6"
+color-eyre = "0.6"
+
+# Logging facade (for moleculer config)
+log = "0.4"
+
+# HTTP client for tts-client
+reqwest = { version = "0.11", features = ["json"] }
+
+# Simple HTTP client for model downloader
+ureq = { version = "2.9", features = ["json"] }
+
+# Moleculer microservice framework - use local version for HTTP transport
+[dependencies.moleculer]
+path = "../"
+
+[[bin]]
+name = "tts-service"
+path = "src/bin/tts_service.rs"
+
+[[bin]]
+name = "tts-client"
+path = "src/bin/tts_client.rs"
+
+[[bin]]
+name = "model-downloader"
+path = "src/bin/model_downloader.rs"
+

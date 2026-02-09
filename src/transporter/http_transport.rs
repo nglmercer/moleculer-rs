@@ -16,6 +16,7 @@ use std::task::{Context, Poll};
 use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
+use uuid::Uuid;
 use warp::Filter;
 
 use super::{Error, MessageStream, ReceivedMessage, Result, Transport};
@@ -84,10 +85,11 @@ impl HttpTransport {
                     }
                     drop(subs);
 
-                    // Send acknowledgment
+                    // Send acknowledgment with request ID
+                    let request_id = Uuid::new_v4().to_string();
                     let response = HttpResponse {
                         success: true,
-                        data: vec![],
+                        data: request_id.as_bytes().to_vec(),
                         error: None,
                     };
                     warp::reply::with_status(

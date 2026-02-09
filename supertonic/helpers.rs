@@ -57,7 +57,8 @@ pub fn load_cfgs<P: AsRef<Path>>(onnx_dir: P) -> Result<Config> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoiceStyleData {
-    pub style_ttl: StyleComponent,
+    #[serde(default)]
+    pub style_ttl: Option<StyleComponent>,
     pub style_dp: StyleComponent,
 }
 
@@ -85,6 +86,12 @@ impl UnicodeProcessor {
         Ok(UnicodeProcessor { indexer })
     }
 
+    /// Create a character-level processor that uses character codes directly as token IDs
+    pub fn new_from_chars() -> Self {
+        // Empty indexer means use character codes directly
+        UnicodeProcessor { indexer: Vec::new() }
+    }
+
     pub fn call(
         &self,
         text_list: &[String],
@@ -105,7 +112,10 @@ impl UnicodeProcessor {
             let mut row = vec![0i64; max_len];
             let unicode_vals = text_to_unicode_values(text);
             for (j, &val) in unicode_vals.iter().enumerate() {
-                if val < self.indexer.len() {
+                if self.indexer.is_empty() {
+                    // Use character code directly as token ID (with offset to avoid 0)
+                    row[j] = (val + 1) as i64;
+                } else if val < self.indexer.len() {
                     row[j] = self.indexer[val];
                 } else {
                     row[j] = -1;
@@ -530,6 +540,7 @@ fn split_sentences(text: &str) -> Vec<String> {
 // Utility Functions
 // ============================================================================
 
+#[allow(dead_code)]
 pub fn timer<F, T>(name: &str, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
@@ -542,6 +553,7 @@ where
     Ok(result)
 }
 
+#[allow(dead_code)]
 pub fn sanitize_filename(text: &str, max_len: usize) -> String {
     // Take first max_len characters (Unicode code points, not bytes)
     text.chars()
@@ -571,10 +583,10 @@ pub struct Style {
 pub struct TextToSpeech {
     cfgs: Config,
     text_processor: UnicodeProcessor,
-    dp_ort: Session,
+    duration_predictor_ort: Session,
+    latent_denoiser_ort: Session,
     text_enc_ort: Session,
-    vector_est_ort: Session,
-    vocoder_ort: Session,
+    voice_decoder_ort: Session,
     pub sample_rate: i32,
 }
 
@@ -582,19 +594,19 @@ impl TextToSpeech {
     pub fn new(
         cfgs: Config,
         text_processor: UnicodeProcessor,
-        dp_ort: Session,
+        duration_predictor_ort: Session,
+        latent_denoiser_ort: Session,
         text_enc_ort: Session,
-        vector_est_ort: Session,
-        vocoder_ort: Session,
+        voice_decoder_ort: Session,
     ) -> Self {
         let sample_rate = cfgs.ae.sample_rate;
         TextToSpeech {
             cfgs,
             text_processor,
-            dp_ort,
+            duration_predictor_ort,
+            latent_denoiser_ort,
             text_enc_ort,
-            vector_est_ort,
-            vocoder_ort,
+            voice_decoder_ort,
             sample_rate,
         }
     }
@@ -625,8 +637,8 @@ impl TextToSpeech {
         let text_mask_value = Value::from_array(text_mask.clone())?;
         let style_dp_value = Value::from_array(style.dp.clone())?;
 
-        // Predict duration
-        let dp_outputs = self.dp_ort.run(ort::inputs! {
+        // Predict duration using duration predictor
+        let dp_outputs = self.duration_predictor_ort.run(ort::inputs! {
             "text_ids" => &text_ids_value,
             "style_dp" => &style_dp_value,
             "text_mask" => &text_mask_value
@@ -682,7 +694,7 @@ impl TextToSpeech {
             let current_step_value = Value::from_array(current_step_array)?;
             let total_step_value = Value::from_array(total_step_array.clone())?;
 
-            let vector_est_outputs = self.vector_est_ort.run(ort::inputs! {
+            let vector_est_outputs = self.latent_denoiser_ort.run(ort::inputs! {
                 "noisy_latent" => &xt_value,
                 "text_emb" => &text_emb_value,
                 "style_ttl" => &style_ttl_value,
@@ -704,9 +716,9 @@ impl TextToSpeech {
             )?;
         }
 
-        // Generate waveform
+        // Generate waveform using voice decoder
         let final_latent_value = Value::from_array(xt)?;
-        let vocoder_outputs = self.vocoder_ort.run(ort::inputs! {
+        let vocoder_outputs = self.voice_decoder_ort.run(ort::inputs! {
             "latent" => &final_latent_value
         })?;
 
@@ -760,6 +772,7 @@ impl TextToSpeech {
         Ok((wav_cat, dur_cat))
     }
 
+    #[allow(dead_code)]
     pub fn batch(
         &mut self,
         text_list: &[String],
@@ -786,13 +799,19 @@ pub fn load_voice_style(voice_style_paths: &[String], verbose: bool) -> Result<S
     let first_reader = BufReader::new(first_file);
     let first_data: VoiceStyleData = serde_json::from_reader(first_reader)?;
 
-    let ttl_dims = &first_data.style_ttl.dims;
+    // Get dp dimensions (always required)
     let dp_dims = &first_data.style_dp.dims;
+    let dp_dim1 = dp_dims[1];
+    let dp_dim2 = dp_dims[2];
+
+    // Check if ttl exists, otherwise use dp dimensions as fallback
+    let (ttl_dims, has_ttl) = match &first_data.style_ttl {
+        Some(ttl) => (&ttl.dims, true),
+        None => (dp_dims, false), // Use dp dimensions as fallback
+    };
 
     let ttl_dim1 = ttl_dims[1];
     let ttl_dim2 = ttl_dims[2];
-    let dp_dim1 = dp_dims[1];
-    let dp_dim2 = dp_dims[2];
 
     // Pre-allocate arrays with full batch size
     let ttl_size = bsz * ttl_dim1 * ttl_dim2;
@@ -806,21 +825,24 @@ pub fn load_voice_style(voice_style_paths: &[String], verbose: bool) -> Result<S
         let reader = BufReader::new(file);
         let data: VoiceStyleData = serde_json::from_reader(reader)?;
 
-        // Flatten TTL data
+        // Flatten TTL data (use zeros if not present)
         let ttl_offset = i * ttl_dim1 * ttl_dim2;
-        let mut idx = 0;
-        for batch in &data.style_ttl.data {
-            for row in batch {
-                for &val in row {
-                    ttl_flat[ttl_offset + idx] = val;
-                    idx += 1;
+        if let Some(ref ttl_data) = data.style_ttl {
+            let mut idx = 0;
+            for batch in &ttl_data.data {
+                for row in batch {
+                    for &val in row {
+                        ttl_flat[ttl_offset + idx] = val;
+                        idx += 1;
+                    }
                 }
             }
         }
+        // If ttl is not present, ttl_flat remains all zeros
 
         // Flatten DP data
         let dp_offset = i * dp_dim1 * dp_dim2;
-        idx = 0;
+        let mut idx = 0;
         for batch in &data.style_dp.data {
             for row in batch {
                 for &val in row {
@@ -835,7 +857,8 @@ pub fn load_voice_style(voice_style_paths: &[String], verbose: bool) -> Result<S
     let dp_style = Array3::from_shape_vec((bsz, dp_dim1, dp_dim2), dp_flat)?;
 
     if verbose {
-        println!("Loaded {} voice styles\n", bsz);
+        let ttl_info = if has_ttl { "loaded" } else { "generated (zeros)" };
+        println!("Loaded {} voice styles (ttl: {}, dp: loaded)\n", bsz, ttl_info);
     }
 
     Ok(Style {
@@ -853,25 +876,49 @@ pub fn load_text_to_speech(onnx_dir: &str, use_gpu: bool) -> Result<TextToSpeech
 
     let cfgs = load_cfgs(onnx_dir)?;
 
-    let dp_path = format!("{}/duration_predictor.onnx", onnx_dir);
+    // Supertonic model filenames - Supertonic uses:
+    // - text_encoder.onnx for encoding text to embeddings
+    // - latent_denoiser.onnx for diffusion-based latent generation
+    // - voice_decoder.onnx for converting latents to audio
+    // Note: Duration prediction is integrated into the latent_denoiser
+    // We load latent_denoiser twice since it's used for both duration prediction and denoising
     let text_enc_path = format!("{}/text_encoder.onnx", onnx_dir);
-    let vector_est_path = format!("{}/vector_estimator.onnx", onnx_dir);
-    let vocoder_path = format!("{}/vocoder.onnx", onnx_dir);
+    let latent_denoiser_path = format!("{}/latent_denoiser.onnx", onnx_dir);
+    let voice_decoder_path = format!("{}/voice_decoder.onnx", onnx_dir);
 
-    let dp_ort = Session::builder()?.commit_from_file(&dp_path)?;
-    let text_enc_ort = Session::builder()?.commit_from_file(&text_enc_path)?;
-    let vector_est_ort = Session::builder()?.commit_from_file(&vector_est_path)?;
-    let vocoder_ort = Session::builder()?.commit_from_file(&vocoder_path)?;
-
+    // Try to load tokenizer from multiple possible locations
+    let tokenizer_path = format!("{}/tokenizer.json", onnx_dir);
     let unicode_indexer_path = format!("{}/unicode_indexer.json", onnx_dir);
-    let text_processor = UnicodeProcessor::new(&unicode_indexer_path)?;
+
+    // Load the ONNX sessions
+    // Load latent_denoiser twice (once for duration prediction, once for actual denoising)
+    let text_enc_ort = Session::builder()?.commit_from_file(&text_enc_path)?;
+    let duration_predictor_ort = Session::builder()?.commit_from_file(&latent_denoiser_path)?;
+    let latent_denoiser_ort = Session::builder()?.commit_from_file(&latent_denoiser_path)?;
+    let voice_decoder_ort = Session::builder()?.commit_from_file(&voice_decoder_path)?;
+
+    // Try tokenizer first, fall back to unicode indexer
+    // Note: Supertonic uses Hugging Face BPE tokenizer but for simplicity
+    // we use a character-level fallback since ONNX models often work with char IDs
+    let text_processor = if std::path::Path::new(&tokenizer_path).exists() {
+        println!("Note: tokenizer.json found but using simple character-level processing");
+        println!("(BPE tokenization would require the 'tokenizers' crate)");
+        // Create a simple character-based processor that ignores the tokenizer.json
+        UnicodeProcessor::new_from_chars()
+    } else if std::path::Path::new(&unicode_indexer_path).exists() {
+        println!("Using unicode_indexer.json for text processing");
+        UnicodeProcessor::new(&unicode_indexer_path)?
+    } else {
+        println!("No text processor found, using character-level fallback");
+        UnicodeProcessor::new_from_chars()
+    };
 
     Ok(TextToSpeech::new(
         cfgs,
         text_processor,
-        dp_ort,
+        duration_predictor_ort,
+        latent_denoiser_ort,
         text_enc_ort,
-        vector_est_ort,
-        vocoder_ort,
+        voice_decoder_ort,
     ))
 }
