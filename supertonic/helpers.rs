@@ -624,7 +624,8 @@ impl TextToSpeech {
         // Process text
         let (text_ids, text_mask) = self.text_processor.call(text_list, lang_list)?;
 
-        let text_ids_array = {
+        // Create input_ids as int64 array
+        let text_ids_array: Array<i64, ndarray::Ix2> = {
             let text_ids_shape = (bsz, text_ids[0].len());
             let mut flat = Vec::new();
             for row in &text_ids {
@@ -633,18 +634,53 @@ impl TextToSpeech {
             Array::from_shape_vec(text_ids_shape, flat)?
         };
 
-        let text_ids_value = Value::from_array(text_ids_array)?;
-        let text_mask_value = Value::from_array(text_mask.clone())?;
-        let style_dp_value = Value::from_array(style.dp.clone())?;
+        // Create attention_mask as int64 2D array (bsz, seq_len) - model expects rank 2
+        // text_mask is 3D (bsz, 1, seq_len), we need to squeeze to 2D
+        let attention_mask_array: Array<i64, ndarray::Ix2> = {
+            let (b, _c, s) = text_mask.dim();
+            let mut mask_2d = Array::<i64, ndarray::Ix2>::zeros((b, s));
+            for i in 0..b {
+                for j in 0..s {
+                    mask_2d[[i, j]] = text_mask[[i, 0, j]] as i64;
+                }
+            }
+            mask_2d
+        };
 
-        // Predict duration using duration predictor
-        let dp_outputs = self.duration_predictor_ort.run(ort::inputs! {
-            "text_ids" => &text_ids_value,
-            "style_dp" => &style_dp_value,
-            "text_mask" => &text_mask_value
+        let text_ids_value = Value::from_array(text_ids_array)?;
+        let attention_mask_value = Value::from_array(attention_mask_array.clone())?;
+
+        // Run text encoder - it outputs both embeddings and durations
+        // text_encoder.onnx inputs: input_ids (int64), attention_mask (int64), style (float)
+        // The model expects style shape [batch, 101, 128] - fixed dimensions
+        // We need to create a compatible style tensor with padding/truncation
+        let fixed_seq_len = 101;
+        let style_dim = 128;
+        let style_array = {
+            // Create style tensor with fixed shape [bsz, 101, 128]
+            let mut style_3d = Array3::<f32>::zeros((bsz, fixed_seq_len, style_dim));
+            // If style.ttl has data, use it; otherwise use zeros
+            let (s_bsz, s_dim1, s_dim2) = style.ttl.dim();
+            if s_dim1 > 0 && s_dim2 > 0 {
+                // Copy style values, handling dimension mismatches
+                for b in 0..bsz {
+                    for s in 0..fixed_seq_len.min(s_dim1) {
+                        for d in 0..style_dim.min(s_dim2) {
+                            style_3d[[b, s, d]] = style.ttl[[b % s_bsz, s, d]];
+                        }
+                    }
+                }
+            }
+            style_3d
+        };
+        let style_value = Value::from_array(style_array)?;
+        let text_enc_outputs = self.text_enc_ort.run(ort::inputs! {
+            "input_ids" => &text_ids_value,
+            "attention_mask" => &attention_mask_value,
+            "style" => &style_value
         })?;
 
-        let (_, duration_data) = dp_outputs["duration"].try_extract_tensor::<f32>()?;
+        let (_, duration_data) = text_enc_outputs["durations"].try_extract_tensor::<f32>()?;
         let mut duration: Vec<f32> = duration_data.to_vec();
 
         // Apply speed factor to duration
@@ -652,16 +688,10 @@ impl TextToSpeech {
             *dur /= speed;
         }
 
-        // Encode text
-        let style_ttl_value = Value::from_array(style.ttl.clone())?;
-        let text_enc_outputs = self.text_enc_ort.run(ort::inputs! {
-            "text_ids" => &text_ids_value,
-            "style_ttl" => &style_ttl_value,
-            "text_mask" => &text_mask_value
-        })?;
-
+        // Get text embeddings from the same text encoder run (reuse outputs)
+        // text_encoder.onnx outputs: last_hidden_state, durations
         let (text_emb_shape, text_emb_data) =
-            text_enc_outputs["text_emb"].try_extract_tensor::<f32>()?;
+            text_enc_outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
         let text_emb = Array3::from_shape_vec(
             (
                 text_emb_shape[0] as usize,
@@ -680,32 +710,54 @@ impl TextToSpeech {
             self.cfgs.ttl.latent_dim,
         );
 
-        // Prepare constant arrays
-        let total_step_array = Array::from_elem(bsz, total_step as f32);
+        // Prepare constant arrays - timestep and num_inference_steps expect int64
+        let total_step_array: Array<i64, ndarray::Ix1> = Array::from_elem(bsz, total_step as i64);
 
         // Denoising loop
+        // latent_denoiser.onnx inputs: noisy_latents, encoder_outputs, latent_mask, attention_mask, timestep, num_inference_steps, style
+        // latent_denoiser.onnx outputs: denoised_latents
         for step in 0..total_step {
-            let current_step_array = Array::from_elem(bsz, step as f32);
+            let current_step_array: Array<i64, ndarray::Ix1> = Array::from_elem(bsz, step as i64);
 
             let xt_value = Value::from_array(xt.clone())?;
             let text_emb_value = Value::from_array(text_emb.clone())?;
             let latent_mask_value = Value::from_array(latent_mask.clone())?;
-            let text_mask_value2 = Value::from_array(text_mask.clone())?;
             let current_step_value = Value::from_array(current_step_array)?;
             let total_step_value = Value::from_array(total_step_array.clone())?;
 
+            // Reuse the attention_mask_array created earlier (it's already int64 2D)
+            let attention_mask_value2 = Value::from_array(attention_mask_array.clone())?;
+            
+            // Create style tensor for latent denoiser with correct shape
+            let style_for_denoiser = {
+                // Create style tensor with shape [bsz, 101, 128]
+                let mut style_3d = Array3::<f32>::zeros((bsz, 101, 128));
+                let (s_bsz, s_dim1, s_dim2) = style.ttl.dim();
+                if s_dim1 > 0 && s_dim2 > 0 {
+                    for b in 0..bsz {
+                        for s in 0..101.min(s_dim1) {
+                            for d in 0..128.min(s_dim2) {
+                                style_3d[[b, s, d]] = style.ttl[[b % s_bsz, s, d]];
+                            }
+                        }
+                    }
+                }
+                style_3d
+            };
+            let style_value2 = Value::from_array(style_for_denoiser)?;
+            
             let vector_est_outputs = self.latent_denoiser_ort.run(ort::inputs! {
-                "noisy_latent" => &xt_value,
-                "text_emb" => &text_emb_value,
-                "style_ttl" => &style_ttl_value,
+                "noisy_latents" => &xt_value,
+                "encoder_outputs" => &text_emb_value,
                 "latent_mask" => &latent_mask_value,
-                "text_mask" => &text_mask_value2,
-                "current_step" => &current_step_value,
-                "total_step" => &total_step_value
+                "attention_mask" => &attention_mask_value2,
+                "timestep" => &current_step_value,
+                "num_inference_steps" => &total_step_value,
+                "style" => &style_value2
             })?;
 
             let (denoised_shape, denoised_data) =
-                vector_est_outputs["denoised_latent"].try_extract_tensor::<f32>()?;
+                vector_est_outputs["denoised_latents"].try_extract_tensor::<f32>()?;
             xt = Array3::from_shape_vec(
                 (
                     denoised_shape[0] as usize,
@@ -717,12 +769,14 @@ impl TextToSpeech {
         }
 
         // Generate waveform using voice decoder
+        // voice_decoder.onnx inputs: latents
+        // voice_decoder.onnx outputs: waveform
         let final_latent_value = Value::from_array(xt)?;
         let vocoder_outputs = self.voice_decoder_ort.run(ort::inputs! {
-            "latent" => &final_latent_value
+            "latents" => &final_latent_value
         })?;
 
-        let (_, wav_data) = vocoder_outputs["wav_tts"].try_extract_tensor::<f32>()?;
+        let (_, wav_data) = vocoder_outputs["waveform"].try_extract_tensor::<f32>()?;
         let wav: Vec<f32> = wav_data.to_vec();
 
         Ok((wav, duration))

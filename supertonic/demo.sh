@@ -158,10 +158,10 @@ start_service() {
     
     cargo run --bin tts-service -- \
         --onnx-dir "${ONNX_DIR}" \
+        --voice-style "${ONNX_DIR}/voice_style.json" \
         --address "0.0.0.0:8080" \
         --node-id "tts-demo-node" \
-        --output-dir "${SCRIPT_DIR}/output" \
-        --write-wav
+        --output-dir "${SCRIPT_DIR}/cache"
 }
 
 run_client() {
@@ -210,13 +210,13 @@ full_demo() {
     echo ""
     echo "Starting service in background..."
     
-    # Start service in background
+    # Start service in background (output disabled by default)
     cargo run --bin tts-service -- \
         --onnx-dir "${ONNX_DIR}" \
+        --voice-style "${ONNX_DIR}/voice_style.json" \
         --address "0.0.0.0:8080" \
         --node-id "tts-demo-node" \
-        --output-dir "${SCRIPT_DIR}/output" \
-        --write-wav &
+        --output-dir "${SCRIPT_DIR}/cache" &
     
     SERVICE_PID=$!
     

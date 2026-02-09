@@ -91,8 +91,10 @@ async fn main() -> eyre::Result<()> {
     println!("==============================");
     println!();
 
-    let server_url = "http://localhost:8080";
-    println!("🎯 Target server: {}", server_url);
+    let moleculer_url = "http://localhost:8080";
+    let direct_url = "http://localhost:8081";
+    println!("🎯 Moleculer server: {}", moleculer_url);
+    println!("🎯 Direct synthesis server: {}", direct_url);
     println!();
 
     // Create HTTP client
@@ -102,7 +104,7 @@ async fn main() -> eyre::Result<()> {
 
     // Test 1: Health check
     println!("📝 Test 1: Health check");
-    match client.get(format!("{}/health", server_url)).send().await {
+    match client.get(format!("{}/health", moleculer_url)).send().await {
         Ok(response) => {
             if response.status().is_success() {
                 let health: HealthResponse = response.json().await?;
@@ -130,7 +132,7 @@ async fn main() -> eyre::Result<()> {
     let list_langs_request = serde_json::json!({});
 
     match client
-        .post(format!("{}/publish", server_url))
+        .post(format!("{}/publish", moleculer_url))
         .json(&serde_json::json!({
             "topic": "tts.listLanguages",
             "data": serde_json::to_vec(&list_langs_request)?,
@@ -154,8 +156,8 @@ async fn main() -> eyre::Result<()> {
     }
     println!();
 
-    // Test 3: Synthesize speech
-    println!("📝 Test 3: Synthesize speech");
+    // Test 3: Synthesize speech using direct /synthesize endpoint
+    println!("📝 Test 3: Synthesize speech (direct endpoint)");
 
     let tts_request = TTSRequest {
         text: "Hello, this is a test of the Supertonic TTS service.".to_string(),
@@ -164,81 +166,46 @@ async fn main() -> eyre::Result<()> {
         denoising_steps: Some(4),
     };
 
-    // Create the HTTP message for moleculer
-    let message = serde_json::json!({
-        "topic": "tts.synthesize",
-        "data": serde_json::to_vec(&tts_request)?,
-        "sender": "tts-client",
-        "reply_to": None::<String>
-    });
-
     println!("   Sending TTS request...");
     match client
-        .post(format!("{}/publish", server_url))
-        .json(&message)
+        .post(format!("{}/synthesize", direct_url))
+        .json(&tts_request)
         .send()
         .await
     {
-        Ok(http_resp) => {
-            if http_resp.status().is_success() {
-                // Get request ID from response
-                let resp_json: serde_json::Value = http_resp.json().await?;
-                let request_id = resp_json["data"].as_str()
-                    .ok_or_else(|| eyre::eyre!("No request ID in response"))?;
-                
-                println!("   Request ID: {}", request_id);
-                println!("   Waiting for TTS response...");
-                
-                // Poll for response file
-                let response_file = Path::new("output/responses").join(format!("{}.json", request_id));
-                let max_attempts = 30;
-                let mut attempts = 0;
-                let mut response_data = None;
-                
-                while attempts < max_attempts {
-                    if response_file.exists() {
-                        match std::fs::read_to_string(&response_file) {
-                            Ok(content) => {
-                                response_data = Some(serde_json::from_str(&content)?);
-                                break;
-                            }
-                            Err(_) => {}
+        Ok(response) => {
+            if response.status().is_success() {
+                let response: TTSResponse = response.json().await?;
+                if response.success {
+                    if let Some(audio_base64) = response.audio {
+                        let audio_bytes = base64::Engine::decode(
+                            &base64::engine::general_purpose::STANDARD,
+                            &audio_base64,
+                        )?;
+
+                        // Create output directory if it doesn't exist
+                        let output_dir = Path::new("output");
+                        if !output_dir.exists() {
+                            std::fs::create_dir_all(output_dir)?;
                         }
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    attempts += 1;
-                }
-                
-                if let Some(response) = response_data {
-                    if response["success"].as_bool().unwrap_or(false) {
-                        if let Some(audio_base64) = response["audio"].as_str() {
-                            let audio_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, audio_base64)?;
-                            
-                            // Create output directory if it doesn't exist
-                            let output_dir = Path::new("output");
-                            if !output_dir.exists() {
-                                std::fs::create_dir_all(output_dir)?;
-                            }
-                            
-                            // Write audio to file
-                            let output_path = output_dir.join("audio.wav");
-                            let mut file = File::create(&output_path)?;
-                            file.write_all(&audio_bytes)?;
-                            
-                            println!("✅ Audio saved to: {:?}", output_path);
-                            println!("   Duration: {:.2}s", response["duration"].as_f64().unwrap_or(0.0));
-                            println!("   Sample rate: {} Hz", response["sample_rate"].as_i64().unwrap_or(0));
-                        } else {
-                            println!("❌ No audio data in response");
-                        }
+
+                        // Write audio to file
+                        let output_path = output_dir.join("audio.wav");
+                        let mut file = File::create(&output_path)?;
+                        file.write_all(&audio_bytes)?;
+
+                        println!("✅ Audio saved to: {:?}", output_path);
+                        println!("   Duration: {:.2}s", response.duration.unwrap_or(0.0));
+                        println!("   Sample rate: {} Hz", response.sample_rate.unwrap_or(0));
+                        println!("   Audio size: {} bytes", audio_bytes.len());
                     } else {
-                        println!("❌ TTS synthesis failed: {:?}", response["error"]);
+                        println!("❌ No audio data in response");
                     }
                 } else {
-                    println!("❌ Timeout waiting for TTS response");
+                    println!("❌ TTS synthesis failed: {:?}", response.error);
                 }
             } else {
-                println!("❌ TTS request failed with status: {}", http_resp.status());
+                println!("❌ TTS request failed with status: {}", response.status());
             }
         }
         Err(e) => {
@@ -262,7 +229,7 @@ async fn main() -> eyre::Result<()> {
 
     // Use direct synthesize endpoint
     match client
-        .post(format!("{}/synthesize", server_url))
+        .post(format!("{}/synthesize", direct_url))
         .json(&tts_request_es)
         .send()
         .await
@@ -273,17 +240,20 @@ async fn main() -> eyre::Result<()> {
                 let response: TTSResponse = response.json().await?;
                 if response.success {
                     if let Some(audio_base64) = response.audio {
-                        let audio_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &audio_base64)?;
-                        
+                        let audio_bytes = base64::Engine::decode(
+                            &base64::engine::general_purpose::STANDARD,
+                            &audio_base64,
+                        )?;
+
                         let output_dir = Path::new("output");
                         if !output_dir.exists() {
                             std::fs::create_dir_all(output_dir)?;
                         }
-                        
+
                         let output_path = output_dir.join("audio_es.wav");
                         let mut file = File::create(&output_path)?;
                         file.write_all(&audio_bytes)?;
-                        
+
                         println!("✅ Spanish audio saved to: {:?}", output_path);
                     } else {
                         println!("❌ No audio data in Spanish response");

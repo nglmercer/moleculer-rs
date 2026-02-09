@@ -29,6 +29,9 @@ clap = { version = "4.5", features = ["derive"] }
 # Error handling
 anyhow = "1.0"
 
+# UUID generation
+uuid = { version = "1.0", features = ["v4"] }
+
 # Unicode normalization
 unicode-normalization = "0.1"
 
@@ -69,6 +72,7 @@ reqwest = { version = "0.11", features = ["json"] }
 
 # Simple HTTP client for model downloader
 ureq = { version = "2.9", features = ["json"] }
+warp = { version = "0.4.2", features = ["server"] }
 
 # Moleculer microservice framework - use local version for HTTP transport
 [dependencies.moleculer]
@@ -85,4 +89,8 @@ path = "src/bin/tts_client.rs"
 [[bin]]
 name = "model-downloader"
 path = "src/bin/model_downloader.rs"
+
+[[bin]]
+name = "direct-test"
+path = "src/bin/direct_test.rs"
 

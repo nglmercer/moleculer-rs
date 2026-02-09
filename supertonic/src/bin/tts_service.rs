@@ -53,12 +53,15 @@ use moleculer::{
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use tokio::task::JoinHandle;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 use uuid::Uuid;
+use warp::Filter;
 
 // Import the helpers module from the parent
 mod helpers {
@@ -80,6 +83,9 @@ static WRITE_WAV: OnceCell<std::sync::atomic::AtomicBool> = OnceCell::new();
 /// Global output directory
 static OUTPUT_DIR: OnceCell<PathBuf> = OnceCell::new();
 
+/// Global node ID for HTTP responses
+static NODE_ID: OnceCell<String> = OnceCell::new();
+
 /// Default ONNX models directory
 const DEFAULT_ONNX_DIR: &str = "./onnx_models";
 
@@ -87,6 +93,179 @@ const DEFAULT_ONNX_DIR: &str = "./onnx_models";
 const DEFAULT_VOICE_STYLE: &str = "./voice_style.json";
 
 // ============================================================================
+// ============================================================================
+// Direct HTTP Server for /synthesize endpoint
+// ============================================================================
+
+
+fn default_speed_val() -> f32 {
+    1.0
+}
+
+fn default_denoising_steps_val() -> usize {
+    4
+}
+
+fn default_silence_duration_val() -> f32 {
+    0.2
+}
+/// Direct TTS synthesis request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectTTSRequest {
+    pub text: String,
+    #[serde(default = "default_lang")]
+    pub lang: String,
+    #[serde(default = "default_speed_val")]
+    pub speed: f32,
+    #[serde(default = "default_denoising_steps_val")]
+    pub denoising_steps: usize,
+    #[serde(default = "default_silence_duration_val")]
+    pub silence_duration: f32,
+}
+
+/// Direct TTS response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectTTSResponse {
+    pub success: bool,
+    pub audio: Option<String>,
+    pub duration: Option<f32>,
+    pub sample_rate: Option<i32>,
+    pub error: Option<String>,
+}
+
+/// Start direct HTTP server for /synthesize endpoint
+async fn start_direct_http_server(address: &str) -> Result<JoinHandle<()>> {
+    let node_id = NODE_ID.get()
+        .map(|s| s.clone())
+        .unwrap_or_else(|| "tts-service".to_string());
+    
+    // Health check endpoint
+    let health = warp::path!("health").map(move || {
+        warp::reply::json(&serde_json::json!({
+            "status": "ok",
+            "node_id": node_id.clone(),
+        }))
+    });
+    
+    // Synthesize endpoint - direct TTS synthesis
+    let synthesize = warp::path!("synthesize")
+        .and(warp::post())
+        .and(warp::body::json())
+        .then(|request: DirectTTSRequest| async move {
+            match synthesize_direct(request).await {
+                Ok(response) => warp::reply::json(&response),
+                Err(e) => warp::reply::json(&DirectTTSResponse {
+                    success: false,
+                    audio: None,
+                    duration: None,
+                    sample_rate: None,
+                    error: Some(e.to_string()),
+                }),
+            }
+        });
+    
+    let routes = health.or(synthesize);
+    
+    let addr: SocketAddr = address.parse()
+        .map_err(|e| anyhow::anyhow!("Invalid address: {}", e))?;
+
+    let server = warp::serve(routes).bind(addr).await;
+
+    let handle = tokio::spawn(async move {
+        server.run().await;
+    });
+
+    Ok(handle)
+}
+/// Perform direct TTS synthesis
+async fn synthesize_direct(request: DirectTTSRequest) -> Result<DirectTTSResponse> {
+    info!("Direct synthesis: text='{}', lang={}", request.text, request.lang);
+    
+    if !is_valid_lang(&request.lang) {
+        return Ok(DirectTTSResponse {
+            success: false,
+            audio: None,
+            duration: None,
+            sample_rate: None,
+            error: Some(format!(
+                "Invalid language: {}. Available: {:?}",
+                request.lang,
+                helpers::AVAILABLE_LANGS
+            )),
+        });
+    }
+    
+    let tts_engine = TTS_ENGINE.get()
+        .ok_or_else(|| anyhow::anyhow!("TTS engine not initialized"))?;
+    
+    let voice_style = VOICE_STYLE.get()
+        .ok_or_else(|| anyhow::anyhow!("Voice style not initialized"))?;
+    
+    let (audio_data, duration) = {
+        let mut engine = tts_engine.lock().map_err(|e| anyhow::anyhow!("Mutex lock failed: {}", e))?;
+        engine.call(
+            &request.text,
+            &request.lang,
+            voice_style,
+            request.denoising_steps,
+            request.speed,
+            request.silence_duration,
+        )?
+    };
+    
+    let sample_rate = helpers::load_cfgs(DEFAULT_ONNX_DIR)?.ae.sample_rate;
+    
+    // Write WAV file if enabled
+    if WRITE_WAV.get()
+        .map(|b| b.load(Ordering::Relaxed))
+        .unwrap_or(false)
+    {
+        if let Some(output_dir) = OUTPUT_DIR.get() {
+            let text_preview = request.text
+                .chars()
+                .take(30)
+                .collect::<String>()
+                .replace(|c: char| !c.is_alphanumeric(), "_");
+            
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let filename = format!(
+                "{}/{}_{}_{}.wav",
+                output_dir.display(),
+                request.lang,
+                text_preview,
+                timestamp
+            );
+            
+            if let Err(e) = helpers::write_wav_file(&filename, &audio_data, sample_rate) {
+                warn!("Failed to write WAV file: {}", e);
+            } else {
+                info!("WAV file written: {}", filename);
+            }
+        }
+    }
+    
+    let wav_bytes = {
+        let mut wav_data: Vec<u8> = Vec::new();
+        write_wav_to_memory(&audio_data, sample_rate, &mut wav_data)?;
+        wav_data
+    };
+    
+    let audio_base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &wav_bytes);
+    
+    info!("Direct synthesis complete: duration={:.2}s, size={} bytes", duration, wav_bytes.len());
+    
+    Ok(DirectTTSResponse {
+        success: true,
+        audio: Some(audio_base64),
+        duration: Some(duration),
+        sample_rate: Some(sample_rate),
+        error: None,
+    })
+}
+
 // CLI Arguments
 // ============================================================================
 
@@ -176,6 +355,7 @@ fn default_denoising_steps() -> Option<usize> {
 }
 
 fn default_silence_duration() -> Option<f32> {
+
     Some(0.2)
 }
 
@@ -321,10 +501,7 @@ fn handle_tts_synthesize(ctx: ActionContext) -> Result<(), Box<dyn Error>> {
     match result {
         Ok((audio_data, duration)) => {
             // Get sample rate
-            let sample_rate = helpers::load_cfgs(DEFAULT_ONNX_DIR)
-                .unwrap()
-                .ae
-                .sample_rate;
+            let sample_rate = helpers::load_cfgs(DEFAULT_ONNX_DIR).unwrap().ae.sample_rate;
 
             // Write WAV file if enabled
             if WRITE_WAV
@@ -383,7 +560,7 @@ fn handle_tts_synthesize(ctx: ActionContext) -> Result<(), Box<dyn Error>> {
 
             // Generate request ID and write response file
             let request_id = Uuid::new_v4().to_string();
-            
+
             // Create response JSON
             let response_json = serde_json::json!({
                 "success": true,
@@ -392,11 +569,16 @@ fn handle_tts_synthesize(ctx: ActionContext) -> Result<(), Box<dyn Error>> {
                 "sample_rate": sample_rate,
                 "request_id": request_id,
             });
-            
+
             // Write response to file
-            let response_dir = OUTPUT_DIR.get()
+            let response_dir = OUTPUT_DIR
+                .get()
                 .map(|p| p.join("responses"))
-                .unwrap_or_else(|| std::path::Path::new("output").join("responses").to_path_buf());
+                .unwrap_or_else(|| {
+                    std::path::Path::new("output")
+                        .join("responses")
+                        .to_path_buf()
+                });
             let _ = std::fs::create_dir_all(&response_dir);
             let response_file = response_dir.join(format!("{}.json", request_id));
             let _ = std::fs::write(&response_file, serde_json::to_string(&response_json)?);
@@ -410,10 +592,35 @@ fn handle_tts_synthesize(ctx: ActionContext) -> Result<(), Box<dyn Error>> {
                 error: None,
             };
 
-            info!("Synthesis complete: duration={:.2}s, request_id={}", duration, request_id);
+            info!(
+                "Synthesis complete: duration={:.2}s, request_id={}",
+                duration, request_id
+            );
             ctx.reply(serde_json::to_value(response)?);
         }
         Err(e) => {
+            // Generate request ID and write error response file
+            let request_id = Uuid::new_v4().to_string();
+
+            let error_response_json = serde_json::json!({
+                "success": false,
+                "error": format!("Synthesis failed: {}", e),
+                "request_id": request_id,
+            });
+
+            // Write error response to file
+            let response_dir = OUTPUT_DIR
+                .get()
+                .map(|p| p.join("responses"))
+                .unwrap_or_else(|| {
+                    std::path::Path::new("output")
+                        .join("responses")
+                        .to_path_buf()
+                });
+            let _ = std::fs::create_dir_all(&response_dir);
+            let response_file = response_dir.join(format!("{}.json", request_id));
+            let _ = std::fs::write(&response_file, serde_json::to_string(&error_response_json)?);
+
             let error_response = TTSResponse {
                 success: false,
                 audio: None,
@@ -552,6 +759,17 @@ async fn main() -> eyre::Result<()> {
         std::process::exit(1);
     });
 
+    
+    // Set global node ID
+    let _ = NODE_ID.set(args.node_id.clone());
+    
+    // Start direct HTTP server for /synthesize endpoint
+    let _http_server_handle = tokio::spawn(async move {
+        if let Err(e) = start_direct_http_server(&format!("0.0.0.0:{}", 8081)).await {
+            warn!("Failed to start direct HTTP server: {}", e);
+        }
+    });
+    
     // Initialize logging
     let log_level = match args.log_level.to_lowercase().as_str() {
         "trace" => Level::TRACE,
