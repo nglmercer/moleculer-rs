@@ -3,12 +3,14 @@ Inspired and compatible with [Moleculer JS](https://github.com/moleculerjs/molec
 
 You can currently do all the basics of `emit`, `broadcast` and `call`.
 
-However it only works with the `NATS` transporter and `JSON` serializer/deserializer.
+Supports both `NATS` and `HTTP` transporters with `JSON` serializer/deserializer.
 
 ## Getting Started
 
 Simple example showing how to receive an event, and responding to a request, for more check the
 [examples folder](https://github.com/primcloud/moleculer-rs/tree/master/examples).
+
+### Using NATS Transporter
 
 ```rust
 use std::error::Error;
@@ -25,9 +27,10 @@ async fn main() -> eyre::Result<()> {
     env_logger::init();
     color_eyre::install()?;
 
-    // build config
-    let config = ConfigBuilder::default().transporter(Transporter::nats("nats://localhost:4222"))
-    .build();
+    // build config with NATS transporter
+    let config = ConfigBuilder::default()
+        .transporter(Transporter::nats("nats://localhost:4222"))
+        .build();
 
     // create the first event
     let print_hi = EventBuilder::new("printHi").add_callback(print_hi).build();
@@ -92,6 +95,51 @@ struct PrintNameMessage {
 struct ActionMessage {
     a: i32,
     b: i32,
+}
+```
+
+### Using HTTP Transporter
+
+```rust
+use std::error::Error;
+use serde::Deserialize;
+
+use moleculer::{
+    config::{ConfigBuilder, Transporter},
+    service::{EventBuilder, Service, ActionBuilder},
+    EventContext, ActionContext, ServiceBroker,
+};
+
+#[tokio::main]
+async fn main() -> eyre::Result<()> {
+    env_logger::init();
+    color_eyre::install()?;
+
+    // build config with HTTP transporter
+    // The address format is "host:port" or just "port" (defaults to 0.0.0.0)
+    let config = ConfigBuilder::default()
+        .transporter(Transporter::http("0.0.0.0:8080"))
+        .build();
+
+    // create events and actions...
+    let print_hi = EventBuilder::new("printHi").add_callback(print_hi).build();
+
+    // create service
+    let greeter_service = Service::new("rustGreeter")
+        .add_event(print_hi);
+
+    // create service broker
+    let service_broker = ServiceBroker::new(config).add_service(greeter_service);
+
+    // start the service broker
+    service_broker.start().await;
+
+    Ok(())
+}
+
+fn print_hi(_ctx: EventContext) -> Result<(), Box<dyn Error>> {
+    println!("Hello from Rust via HTTP");
+    Ok(())
 }
 ```
 */

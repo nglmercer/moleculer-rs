@@ -1,9 +1,10 @@
 pub(crate) mod messages;
 
-mod event;
+use crate::transporter::Transport;
 
 mod disconnect;
 mod discover;
+mod event;
 mod heartbeat;
 mod info;
 mod ping;
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use act_zero::runtimes::tokio::spawn_actor;
 use act_zero::*;
 use async_trait::async_trait;
-use log::{debug, error};
+use log::{debug, error, info};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::oneshot::Sender;
@@ -26,7 +27,7 @@ use crate::{
     broker::ServiceBroker,
     config,
     config::{Channel, Config, Transporter},
-    nats,
+    nats, transporter,
 };
 
 use self::{
@@ -51,6 +52,9 @@ pub(crate) enum Error {
     Nats(#[from] nats::Error),
 
     #[error(transparent)]
+    Transport(#[from] transporter::Error),
+
+    #[error(transparent)]
     Deserialize(#[from] config::DeserializeError),
 
     #[error(transparent)]
@@ -71,10 +75,40 @@ impl Actor for ChannelSupervisor {
     }
 }
 
+/// Connection type that wraps either NATS or HTTP transport
+pub(crate) enum TransportConn {
+    Nats(crate::nats::Conn),
+    Http(Arc<tokio::sync::Mutex<Box<dyn transporter::Transport>>>),
+}
+
+impl TransportConn {
+    pub(crate) async fn send(&self, channel: &str, message: Vec<u8>) -> Result<(), Error> {
+        match self {
+            TransportConn::Nats(conn) => conn.send(channel, message).await.map_err(Error::from),
+            TransportConn::Http(transport) => {
+                let transport = transport.lock().await;
+                transport
+                    .publish(channel, &message)
+                    .await
+                    .map_err(Error::from)
+            }
+        }
+    }
+}
+
+impl Clone for TransportConn {
+    fn clone(&self) -> Self {
+        match self {
+            TransportConn::Nats(conn) => TransportConn::Nats(conn.clone()),
+            TransportConn::Http(transport) => TransportConn::Http(transport.clone()),
+        }
+    }
+}
+
 pub(crate) struct ChannelSupervisor {
     broker: Addr<ServiceBroker>,
 
-    conn: nats::Conn,
+    conn: TransportConn,
     config: Arc<Config>,
     pid: WeakAddr<Self>,
     channels: HashMap<Channel, String>,
@@ -106,13 +140,23 @@ impl ChannelSupervisor {
         let channels = Channel::build_hashmap(&config);
 
         let conn = match &config.transporter {
-            Transporter::Nats(nats_address) => nats::Conn::new(nats_address)
-                .await
-                .expect("NATS should connect"),
-            Transporter::Http(_) => {
-                // For HTTP transporter, we'll use a placeholder connection
-                // The HTTP implementation is separate and doesn't integrate with channels yet
-                panic!("HTTP transporter is not yet fully integrated with the channel system. Use NATS for now.")
+            Transporter::Nats(nats_address) => {
+                info!("Connecting to NATS at {}", nats_address);
+                let nats_conn = nats::Conn::new(nats_address)
+                    .await
+                    .expect("NATS should connect");
+                info!("Successfully connected to NATS");
+                TransportConn::Nats(nats_conn)
+            }
+            Transporter::Http(http_address) => {
+                info!("Setting up HTTP transport at {}", http_address);
+                let mut transport =
+                    transporter::HttpTransport::new(http_address.clone(), config.node_id.clone());
+                transport
+                    .connect(&config)
+                    .await
+                    .expect("HTTP transport should connect");
+                TransportConn::Http(Arc::new(tokio::sync::Mutex::new(Box::new(transport))))
             }
         };
 

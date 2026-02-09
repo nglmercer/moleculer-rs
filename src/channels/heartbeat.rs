@@ -1,15 +1,16 @@
 use crate::{
     broker::ServiceBroker,
+    channels::{
+        messages::{incoming, outgoing},
+        TransportConn,
+    },
     config::{Channel, Config},
-    nats::Conn,
 };
 
-use super::messages::{incoming, outgoing};
 use super::ChannelSupervisor;
 use act_zero::runtimes::tokio::Timer;
 use act_zero::timer::Tick;
 use act_zero::*;
-use async_nats::Message;
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use log::{debug, error, info};
@@ -20,7 +21,7 @@ pub(crate) struct Heartbeat {
     pid: Addr<Self>,
     config: Arc<Config>,
     timer: Timer,
-    conn: Conn,
+    conn: TransportConn,
     parent: Addr<ChannelSupervisor>,
     broker: WeakAddr<ServiceBroker>,
     heartbeat_interval: u32,
@@ -74,7 +75,7 @@ impl Heartbeat {
         parent: WeakAddr<ChannelSupervisor>,
         broker: WeakAddr<ServiceBroker>,
         config: &Arc<Config>,
-        conn: &Conn,
+        conn: &TransportConn,
     ) -> Self {
         Self {
             pid: Addr::detached(),
@@ -93,23 +94,57 @@ impl Heartbeat {
     pub(crate) async fn listen(&mut self, pid: Addr<Self>) {
         info!("Listening for HEARTBEAT messages");
 
-        let mut channel = self
-            .conn
-            .subscribe(&Channel::Heartbeat.channel_to_string(&self.config))
-            .await
-            .unwrap();
+        let topic = Channel::Heartbeat.channel_to_string(&self.config);
+        let config = self.config.clone();
+        let broker = self.broker.clone();
 
-        pid.clone().send_fut(async move {
-            while let Some(msg) = channel.next().await {
-                match call!(pid.handle_message(msg)).await {
-                    Ok(_) => debug!("Successfully handled HEARTBEAT message"),
-                    Err(e) => error!("Unable to handle HEARTBEAT message: {}", e),
-                }
+        match &self.conn {
+            TransportConn::Nats(nats_conn) => {
+                let mut channel = nats_conn
+                    .subscribe(&topic)
+                    .await
+                    .expect("Should subscribe to HEARTBEAT channel");
+
+                pid.clone().send_fut(async move {
+                    while let Some(msg) = channel.next().await {
+                        match call!(pid.handle_nats_message(msg)).await {
+                            Ok(_) => debug!("Successfully handled HEARTBEAT message"),
+                            Err(e) => error!("Unable to handle HEARTBEAT message: {}", e),
+                        }
+                    }
+                })
             }
-        })
+            TransportConn::Http(transport) => {
+                let transport = transport.clone();
+
+                pid.clone().send_fut(async move {
+                    let transport_guard = transport.lock().await;
+                    match transport_guard.subscribe(&topic).await {
+                        Ok(mut stream) => {
+                            drop(transport_guard);
+                            while let Some(msg) = stream.next().await {
+                                let heartbeat: Result<incoming::HeartbeatMessage, _> =
+                                    config.serializer.deserialize(&msg.payload);
+
+                                match heartbeat {
+                                    Ok(hb) => {
+                                        send!(broker.handle_heartbeat_message(hb));
+                                        debug!("Successfully handled HEARTBEAT message");
+                                    }
+                                    Err(e) => error!("Unable to handle HEARTBEAT message: {}", e),
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to subscribe to HEARTBEAT channel: {}", e);
+                        }
+                    }
+                })
+            }
+        }
     }
 
-    async fn handle_message(&self, msg: Message) -> ActorResult<()> {
+    async fn handle_nats_message(&self, msg: async_nats::Message) -> ActorResult<()> {
         let heartbeat: incoming::HeartbeatMessage =
             self.config.serializer.deserialize(&msg.payload)?;
 

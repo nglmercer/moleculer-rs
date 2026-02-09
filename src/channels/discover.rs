@@ -1,12 +1,11 @@
 use crate::{
     broker::ServiceBroker,
+    channels::{messages::incoming, messages::outgoing, TransportConn},
     config::{Channel, Config},
-    nats::Conn,
 };
 
-use super::{messages::incoming, messages::outgoing, ChannelSupervisor};
+use super::ChannelSupervisor;
 use act_zero::*;
-use async_nats::Message;
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use log::{debug, error, info};
@@ -27,11 +26,12 @@ impl Actor for Discover {
         false
     }
 }
+
 pub(crate) struct Discover {
     broker: WeakAddr<ServiceBroker>,
     config: Arc<Config>,
     parent: WeakAddr<ChannelSupervisor>,
-    conn: Conn,
+    conn: TransportConn,
 }
 
 impl Discover {
@@ -39,7 +39,7 @@ impl Discover {
         broker: WeakAddr<ServiceBroker>,
         parent: WeakAddr<ChannelSupervisor>,
         config: &Arc<Config>,
-        conn: &Conn,
+        conn: &TransportConn,
     ) -> Self {
         Self {
             broker,
@@ -51,20 +51,60 @@ impl Discover {
 
     pub(crate) async fn listen(&mut self, pid: Addr<Self>) {
         info!("Listening for DISCOVER messages");
-        let mut channel = self
-            .conn
-            .subscribe(&Channel::Discover.channel_to_string(&self.config))
-            .await
-            .unwrap();
 
-        pid.clone().send_fut(async move {
-            while let Some(msg) = channel.next().await {
-                match call!(pid.handle_message(msg)).await {
-                    Ok(_) => debug!("Successfully handled DISCOVER message"),
-                    Err(e) => error!("Unable to handle DISCOVER message: {}", e),
-                }
+        let topic = Channel::Discover.channel_to_string(&self.config);
+        let config = self.config.clone();
+        let broker = self.broker.clone();
+
+        match &self.conn {
+            TransportConn::Nats(nats_conn) => {
+                let mut channel = nats_conn
+                    .subscribe(&topic)
+                    .await
+                    .expect("Should subscribe to DISCOVER channel");
+
+                pid.clone().send_fut(async move {
+                    while let Some(msg) = channel.next().await {
+                        match call!(pid.handle_nats_message(msg)).await {
+                            Ok(_) => debug!("Successfully handled DISCOVER message"),
+                            Err(e) => error!("Unable to handle DISCOVER message: {}", e),
+                        }
+                    }
+                })
             }
-        })
+            TransportConn::Http(transport) => {
+                let transport = transport.clone();
+
+                pid.clone().send_fut(async move {
+                    let transport_guard = transport.lock().await;
+                    match transport_guard.subscribe(&topic).await {
+                        Ok(mut stream) => {
+                            drop(transport_guard);
+                            while let Some(msg) = stream.next().await {
+                                let discover: Result<incoming::DiscoverMessage, _> =
+                                    config.serializer.deserialize(&msg.payload);
+
+                                match discover {
+                                    Ok(disc) => {
+                                        let channel = format!(
+                                            "{}.{}",
+                                            Channel::Info.channel_to_string(&config),
+                                            disc.sender
+                                        );
+                                        send!(broker.publish_info_to_channel(channel));
+                                        debug!("Successfully handled DISCOVER message");
+                                    }
+                                    Err(e) => error!("Unable to handle DISCOVER message: {}", e),
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to subscribe to DISCOVER channel: {}", e);
+                        }
+                    }
+                })
+            }
+        }
     }
 
     pub(crate) async fn broadcast(&self) {
@@ -78,7 +118,7 @@ impl Discover {
         ));
     }
 
-    async fn handle_message(&self, msg: Message) -> ActorResult<()> {
+    async fn handle_nats_message(&self, msg: async_nats::Message) -> ActorResult<()> {
         let discover: incoming::DiscoverMessage =
             self.config.serializer.deserialize(&msg.payload)?;
 
@@ -114,14 +154,14 @@ impl Actor for DiscoverTargeted {
 pub(crate) struct DiscoverTargeted {
     broker: WeakAddr<ServiceBroker>,
     config: Arc<Config>,
-    conn: Conn,
+    conn: TransportConn,
 }
 
 impl DiscoverTargeted {
     pub(crate) async fn new(
         broker: WeakAddr<ServiceBroker>,
         config: &Arc<Config>,
-        conn: &Conn,
+        conn: &TransportConn,
     ) -> Self {
         Self {
             broker,
@@ -132,23 +172,63 @@ impl DiscoverTargeted {
 
     pub(crate) async fn listen(&mut self, pid: Addr<Self>) {
         info!("Listening for DISCOVER (targeted) messages");
-        let mut channel = self
-            .conn
-            .subscribe(&Channel::DiscoverTargeted.channel_to_string(&self.config))
-            .await
-            .unwrap();
 
-        pid.clone().send_fut(async move {
-            while let Some(msg) = channel.next().await {
-                match call!(pid.handle_message(msg)).await {
-                    Ok(_) => debug!("Successfully handled DISCOVER (targeted)"),
-                    Err(e) => error!("Unable to handle DISCOVER (targeted): {}", e),
-                }
+        let topic = Channel::DiscoverTargeted.channel_to_string(&self.config);
+        let config = self.config.clone();
+        let broker = self.broker.clone();
+
+        match &self.conn {
+            TransportConn::Nats(nats_conn) => {
+                let mut channel = nats_conn
+                    .subscribe(&topic)
+                    .await
+                    .expect("Should subscribe to DISCOVER targeted channel");
+
+                pid.clone().send_fut(async move {
+                    while let Some(msg) = channel.next().await {
+                        match call!(pid.handle_nats_message(msg)).await {
+                            Ok(_) => debug!("Successfully handled DISCOVER (targeted)"),
+                            Err(e) => error!("Unable to handle DISCOVER (targeted): {}", e),
+                        }
+                    }
+                })
             }
-        })
+            TransportConn::Http(transport) => {
+                let transport = transport.clone();
+
+                pid.clone().send_fut(async move {
+                    let transport_guard = transport.lock().await;
+                    match transport_guard.subscribe(&topic).await {
+                        Ok(mut stream) => {
+                            drop(transport_guard);
+                            while let Some(msg) = stream.next().await {
+                                let discover: Result<incoming::DiscoverMessage, _> =
+                                    config.serializer.deserialize(&msg.payload);
+
+                                match discover {
+                                    Ok(disc) => {
+                                        let channel = format!(
+                                            "{}.{}",
+                                            Channel::Info.channel_to_string(&config),
+                                            disc.sender
+                                        );
+                                        send!(broker.publish_info_to_channel(channel));
+                                        debug!("Successfully handled DISCOVER (targeted)");
+                                    }
+                                    Err(e) => error!("Unable to handle DISCOVER (targeted): {}", e),
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to subscribe to DISCOVER targeted channel: {}", e);
+                        }
+                    }
+                })
+            }
+        }
     }
 
-    async fn handle_message(&self, msg: Message) -> ActorResult<()> {
+    async fn handle_nats_message(&self, msg: async_nats::Message) -> ActorResult<()> {
         let discover: incoming::DiscoverMessage =
             self.config.serializer.deserialize(&msg.payload)?;
         let channel = format!(

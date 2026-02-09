@@ -1,12 +1,10 @@
 use crate::{
     broker::ServiceBroker,
-    channels::messages::incoming::RequestMessage,
+    channels::{messages::incoming::RequestMessage, TransportConn},
     config::{self, Channel, Config},
-    nats::Conn,
 };
 
 use act_zero::*;
-use async_nats::Message;
 use async_trait::async_trait;
 use config::DeserializeError;
 use futures::StreamExt as _;
@@ -28,17 +26,18 @@ impl Actor for Request {
         false
     }
 }
+
 pub(crate) struct Request {
     config: Arc<Config>,
     broker: WeakAddr<ServiceBroker>,
-    conn: Conn,
+    conn: TransportConn,
 }
 
 impl Request {
     pub(crate) async fn new(
         broker: WeakAddr<ServiceBroker>,
         config: &Arc<Config>,
-        conn: &Conn,
+        conn: &TransportConn,
     ) -> Self {
         Self {
             broker,
@@ -49,28 +48,65 @@ impl Request {
 
     pub(crate) async fn listen(&mut self, pid: Addr<Self>) {
         info!("Listening for REQUEST messages");
-        let mut channel = self
-            .conn
-            .subscribe(&Channel::Request.channel_to_string(&self.config))
-            .await
-            .unwrap();
 
-        pid.clone().send_fut(async move {
-            while let Some(msg) = channel.next().await {
-                match call!(pid.handle_message(msg)).await {
-                    Ok(_) => debug!("Successfully handled REQUEST message"),
-                    Err(e) => error!("Unable to handle REQUEST message: {}", e),
-                }
+        let topic = Channel::Request.channel_to_string(&self.config);
+        let config = self.config.clone();
+        let broker = self.broker.clone();
+
+        match &self.conn {
+            TransportConn::Nats(nats_conn) => {
+                let mut channel = nats_conn
+                    .subscribe(&topic)
+                    .await
+                    .expect("Should subscribe to REQUEST channel");
+
+                pid.clone().send_fut(async move {
+                    while let Some(msg) = channel.next().await {
+                        let request_context: Result<RequestMessage, DeserializeError> =
+                            config.serializer.deserialize(&msg.payload);
+
+                        match call!(pid.handle_nats_message(request_context)).await {
+                            Ok(_) => debug!("Successfully handled REQUEST message"),
+                            Err(e) => error!("Unable to handle REQUEST message: {}", e),
+                        }
+                    }
+                })
             }
-        })
+            TransportConn::Http(transport) => {
+                let transport = transport.clone();
+
+                pid.clone().send_fut(async move {
+                    let transport_guard = transport.lock().await;
+                    match transport_guard.subscribe(&topic).await {
+                        Ok(mut stream) => {
+                            drop(transport_guard);
+                            while let Some(msg) = stream.next().await {
+                                let request_context: Result<RequestMessage, DeserializeError> =
+                                    config.serializer.deserialize(&msg.payload);
+
+                                match request_context {
+                                    Ok(ctx) => {
+                                        send!(broker.handle_incoming_request(Ok(ctx)));
+                                        debug!("Successfully handled REQUEST message");
+                                    }
+                                    Err(e) => error!("Unable to handle REQUEST message: {}", e),
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to subscribe to REQUEST channel: {}", e);
+                        }
+                    }
+                })
+            }
+        }
     }
 
-    async fn handle_message(&self, msg: Message) -> ActorResult<()> {
-        let request_context: Result<RequestMessage, DeserializeError> =
-            self.config.serializer.deserialize(&msg.payload);
-
+    async fn handle_nats_message(
+        &self,
+        request_context: Result<RequestMessage, DeserializeError>,
+    ) -> ActorResult<()> {
         send!(self.broker.handle_incoming_request(request_context));
-
         Produces::ok(())
     }
 }

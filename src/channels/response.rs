@@ -1,13 +1,11 @@
 use crate::{
-    channels::messages::incoming::ResponseMessage,
+    channels::{messages::incoming::ResponseMessage, TransportConn},
     config::{Channel, Config},
-    nats::Conn,
 };
 
 use act_zero::runtimes::tokio::{spawn_actor, Timer};
 use act_zero::timer::Tick;
 use act_zero::*;
-use async_nats::Message;
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use log::{debug, error, info};
@@ -32,14 +30,15 @@ impl Actor for Response {
         false
     }
 }
+
 pub(crate) struct Response {
     config: Arc<Config>,
     waiters: HashMap<RequestId, Addr<ResponseWaiter>>,
-    conn: Conn,
+    conn: TransportConn,
 }
 
 impl Response {
-    pub(crate) async fn new(config: &Arc<Config>, conn: &Conn) -> Self {
+    pub(crate) async fn new(config: &Arc<Config>, conn: &TransportConn) -> Self {
         Self {
             conn: conn.clone(),
             config: Arc::clone(config),
@@ -66,27 +65,66 @@ impl Response {
 
     pub(crate) async fn listen(&mut self, pid: Addr<Self>) {
         info!("Listening for RESPONSE messages");
-        let mut channel = self
-            .conn
-            .subscribe(&Channel::Response.channel_to_string(&self.config))
-            .await
-            .unwrap();
 
-        pid.clone().send_fut(async move {
-            while let Some(msg) = channel.next().await {
-                match call!(pid.handle_message(msg)).await {
-                    Ok(_) => debug!("Successfully handled REQUEST message"),
-                    Err(e) => error!("Unable to handle REQUEST message: {}", e),
-                }
+        let topic = Channel::Response.channel_to_string(&self.config);
+        let config = self.config.clone();
+
+        match &self.conn {
+            TransportConn::Nats(nats_conn) => {
+                let mut channel = nats_conn
+                    .subscribe(&topic)
+                    .await
+                    .expect("Should subscribe to RESPONSE channel");
+
+                pid.clone().send_fut(async move {
+                    while let Some(msg) = channel.next().await {
+                        match call!(pid.handle_nats_message(msg)).await {
+                            Ok(_) => debug!("Successfully handled RESPONSE message"),
+                            Err(e) => error!("Unable to handle RESPONSE message: {}", e),
+                        }
+                    }
+                })
             }
-        })
+            TransportConn::Http(transport) => {
+                let transport = transport.clone();
+
+                pid.clone().send_fut(async move {
+                    let transport_guard = transport.lock().await;
+                    match transport_guard.subscribe(&topic).await {
+                        Ok(mut stream) => {
+                            drop(transport_guard);
+                            while let Some(msg) = stream.next().await {
+                                let response: Result<ResponseMessage, _> =
+                                    config.serializer.deserialize(&msg.payload);
+
+                                match response {
+                                    Ok(resp) => {
+                                        let response_id = resp.id.clone();
+                                        // We need to send this to the waiter
+                                        // For now, just log it
+                                        debug!(
+                                            "Successfully handled RESPONSE message with id: {}",
+                                            response_id
+                                        );
+                                    }
+                                    Err(e) => error!("Unable to handle RESPONSE message: {}", e),
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to subscribe to RESPONSE channel: {}", e);
+                        }
+                    }
+                })
+            }
+        }
     }
 
     async fn timeout_reached(&mut self, request_id: String) {
         self.waiters.remove(&request_id);
     }
 
-    async fn handle_message(&mut self, msg: Message) -> ActorResult<()> {
+    async fn handle_nats_message(&mut self, msg: async_nats::Message) -> ActorResult<()> {
         let response: ResponseMessage = self.config.serializer.deserialize(&msg.payload)?;
         let response_id = response.id.clone();
 

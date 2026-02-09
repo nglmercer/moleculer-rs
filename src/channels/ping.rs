@@ -1,15 +1,12 @@
 use crate::{
+    channels::{
+        messages::{incoming::PingMessage, outgoing::PongMessage},
+        ChannelSupervisor, TransportConn,
+    },
     config::{Channel, Config},
-    nats::Conn,
-};
-
-use super::{
-    messages::{incoming::PingMessage, outgoing::PongMessage},
-    ChannelSupervisor,
 };
 
 use act_zero::*;
-use async_nats::Message;
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use log::{debug, error, info};
@@ -30,9 +27,10 @@ impl Actor for Ping {
         false
     }
 }
+
 pub(crate) struct Ping {
     config: Arc<Config>,
-    conn: Conn,
+    conn: TransportConn,
     parent: WeakAddr<ChannelSupervisor>,
 }
 
@@ -40,7 +38,7 @@ impl Ping {
     pub(crate) async fn new(
         parent: WeakAddr<ChannelSupervisor>,
         config: &Arc<Config>,
-        conn: &Conn,
+        conn: &TransportConn,
     ) -> Self {
         Self {
             parent,
@@ -52,23 +50,68 @@ impl Ping {
     pub(crate) async fn listen(&mut self, pid: Addr<Self>) {
         info!("Listening for PING messages");
 
-        let mut channel = self
-            .conn
-            .subscribe(&Channel::Ping.channel_to_string(&self.config))
-            .await
-            .unwrap();
+        let topic = Channel::Ping.channel_to_string(&self.config);
+        let config = self.config.clone();
+        let parent = self.parent.clone();
 
-        pid.clone().send_fut(async move {
-            while let Some(msg) = channel.next().await {
-                match call!(pid.handle_message(msg)).await {
-                    Ok(_) => debug!("Successfully handled PING message"),
-                    Err(e) => error!("Unable to handle PING message: {}", e),
-                }
+        match &self.conn {
+            TransportConn::Nats(nats_conn) => {
+                let mut channel = nats_conn
+                    .subscribe(&topic)
+                    .await
+                    .expect("Should subscribe to PING channel");
+
+                pid.clone().send_fut(async move {
+                    while let Some(msg) = channel.next().await {
+                        match call!(pid.handle_nats_message(msg)).await {
+                            Ok(_) => debug!("Successfully handled PING message"),
+                            Err(e) => error!("Unable to handle PING message: {}", e),
+                        }
+                    }
+                })
             }
-        })
+            TransportConn::Http(transport) => {
+                let transport = transport.clone();
+
+                pid.clone().send_fut(async move {
+                    let transport_guard = transport.lock().await;
+                    match transport_guard.subscribe(&topic).await {
+                        Ok(mut stream) => {
+                            drop(transport_guard);
+                            while let Some(msg) = stream.next().await {
+                                let ping_message: Result<PingMessage, _> =
+                                    config.serializer.deserialize(&msg.payload);
+
+                                match ping_message {
+                                    Ok(ping) => {
+                                        let channel = format!(
+                                            "{}.{}",
+                                            Channel::PongPrefix.channel_to_string(&config),
+                                            &ping.sender
+                                        );
+                                        let pong_message: PongMessage =
+                                            (ping, config.node_id.as_str()).into();
+
+                                        send!(parent.publish_to_channel(
+                                            channel,
+                                            config.serializer.serialize(pong_message).unwrap()
+                                        ));
+                                        debug!("Successfully handled PING message");
+                                    }
+                                    Err(e) => error!("Unable to handle PING message: {}", e),
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to subscribe to PING channel: {}", e);
+                        }
+                    }
+                })
+            }
+        }
     }
 
-    async fn handle_message(&self, msg: Message) -> ActorResult<()> {
+    async fn handle_nats_message(&self, msg: async_nats::Message) -> ActorResult<()> {
         let ping_message: PingMessage = self.config.serializer.deserialize(&msg.payload)?;
         let channel = format!(
             "{}.{}",
@@ -101,9 +144,10 @@ impl Actor for PingTargeted {
         false
     }
 }
+
 pub(crate) struct PingTargeted {
     config: Arc<Config>,
-    conn: Conn,
+    conn: TransportConn,
     parent: WeakAddr<ChannelSupervisor>,
 }
 
@@ -111,7 +155,7 @@ impl PingTargeted {
     pub(crate) async fn new(
         parent: WeakAddr<ChannelSupervisor>,
         config: &Arc<Config>,
-        conn: &Conn,
+        conn: &TransportConn,
     ) -> Self {
         Self {
             parent,
@@ -123,23 +167,68 @@ impl PingTargeted {
     pub(crate) async fn listen(&mut self, pid: Addr<Self>) {
         info!("Listening for PING (targeted) messages");
 
-        let mut channel = self
-            .conn
-            .subscribe(&Channel::PingTargeted.channel_to_string(&self.config))
-            .await
-            .unwrap();
+        let topic = Channel::PingTargeted.channel_to_string(&self.config);
+        let config = self.config.clone();
+        let parent = self.parent.clone();
 
-        pid.clone().send_fut(async move {
-            while let Some(msg) = channel.next().await {
-                match call!(pid.handle_message(msg)).await {
-                    Ok(_) => debug!("Successfully handled PING message"),
-                    Err(e) => error!("Unable to handle PING message: {}", e),
-                }
+        match &self.conn {
+            TransportConn::Nats(nats_conn) => {
+                let mut channel = nats_conn
+                    .subscribe(&topic)
+                    .await
+                    .expect("Should subscribe to PING targeted channel");
+
+                pid.clone().send_fut(async move {
+                    while let Some(msg) = channel.next().await {
+                        match call!(pid.handle_nats_message(msg)).await {
+                            Ok(_) => debug!("Successfully handled PING message"),
+                            Err(e) => error!("Unable to handle PING message: {}", e),
+                        }
+                    }
+                })
             }
-        })
+            TransportConn::Http(transport) => {
+                let transport = transport.clone();
+
+                pid.clone().send_fut(async move {
+                    let transport_guard = transport.lock().await;
+                    match transport_guard.subscribe(&topic).await {
+                        Ok(mut stream) => {
+                            drop(transport_guard);
+                            while let Some(msg) = stream.next().await {
+                                let ping_message: Result<PingMessage, _> =
+                                    config.serializer.deserialize(&msg.payload);
+
+                                match ping_message {
+                                    Ok(ping) => {
+                                        let channel = format!(
+                                            "{}.{}",
+                                            Channel::PongPrefix.channel_to_string(&config),
+                                            &ping.sender
+                                        );
+                                        let pong_message: PongMessage =
+                                            (ping, config.node_id.as_str()).into();
+
+                                        send!(parent.publish_to_channel(
+                                            channel,
+                                            config.serializer.serialize(pong_message).unwrap()
+                                        ));
+                                        debug!("Successfully handled PING message");
+                                    }
+                                    Err(e) => error!("Unable to handle PING message: {}", e),
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to subscribe to PING targeted channel: {}", e);
+                        }
+                    }
+                })
+            }
+        }
     }
 
-    async fn handle_message(&self, msg: Message) -> ActorResult<()> {
+    async fn handle_nats_message(&self, msg: async_nats::Message) -> ActorResult<()> {
         let ping_message: PingMessage = self.config.serializer.deserialize(&msg.payload)?;
         let channel = format!(
             "{}.{}",

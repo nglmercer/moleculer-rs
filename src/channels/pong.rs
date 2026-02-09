@@ -1,11 +1,9 @@
 use crate::{
+    channels::{ChannelSupervisor, TransportConn},
     config::{Channel, Config},
-    nats::Conn,
 };
 
-use super::{ChannelSupervisor, Error};
 use act_zero::*;
-use async_nats::Message;
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use log::{debug, error, info};
@@ -26,52 +24,66 @@ impl Actor for Pong {
         false
     }
 }
+
 #[allow(dead_code)]
 pub(crate) struct Pong {
     config: Arc<Config>,
-    channel: async_nats::Subscriber,
+    conn: TransportConn,
     parent: WeakAddr<ChannelSupervisor>,
 }
-
-// #[derive(Deserialize)]
-// struct PongMessage {
-//     ver: String,
-//     sender: String,
-//     id: String,
-//     time: i64,
-//     arrived: i64,
-// }
 
 impl Pong {
     pub(crate) async fn new(
         parent: WeakAddr<ChannelSupervisor>,
         config: &Arc<Config>,
-        conn: &Conn,
+        conn: &TransportConn,
     ) -> Self {
         Self {
             parent,
-            channel: conn
-                .subscribe(&Channel::Pong.channel_to_string(config))
-                .await
-                .unwrap(),
+            conn: conn.clone(),
             config: Arc::clone(config),
         }
     }
 
-    pub(crate) async fn listen(&mut self, _pid: Addr<Self>) {
+    pub(crate) async fn listen(&mut self, pid: Addr<Self>) {
         info!("Listening for PONG messages");
 
-        while let Some(msg) = self.channel.next().await {
-            match self.handle_message(msg).await {
-                Ok(_) => debug!("Successfully handled PONG message"),
-                Err(e) => error!("Unable to handle PONG message: {}", e),
+        let topic = Channel::Pong.channel_to_string(&self.config);
+
+        match &self.conn {
+            TransportConn::Nats(nats_conn) => {
+                let mut channel = nats_conn
+                    .subscribe(&topic)
+                    .await
+                    .expect("Should subscribe to PONG channel");
+
+                pid.clone().send_fut(async move {
+                    while let Some(msg) = channel.next().await {
+                        // do nothing with incoming pong messages for now
+                        let _ = msg;
+                        debug!("Successfully handled PONG message");
+                    }
+                })
+            }
+            TransportConn::Http(transport) => {
+                let transport = transport.clone();
+
+                pid.clone().send_fut(async move {
+                    let transport_guard = transport.lock().await;
+                    match transport_guard.subscribe(&topic).await {
+                        Ok(mut stream) => {
+                            drop(transport_guard);
+                            while let Some(_msg) = stream.next().await {
+                                // do nothing with incoming pong messages for now
+                                debug!("Successfully handled PONG message");
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to subscribe to PONG channel: {}", e);
+                        }
+                    }
+                })
             }
         }
-    }
-
-    async fn handle_message(&self, _msg: Message) -> Result<(), Error> {
-        // let pong_msg: PongMessage = self.config.serializer.deserialize(&msg.payload)?;
-        // do nothing with incoming disconnect messages for now
-        Ok(())
     }
 }
